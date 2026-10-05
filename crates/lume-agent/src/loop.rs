@@ -22,7 +22,7 @@ use lume_core::types::{ChatRequest, Message, Role, SamplingParams};
 use lume_mcp::ToolRegistry;
 
 use crate::context::Conversation;
-use crate::parsing::{parse_tool_calls, strip_tool_calls};
+use crate::parsing::{is_rejected_tool_call_blob, parse_tool_calls, strip_tool_calls};
 
 /// Agent configuration.
 #[derive(Debug, Clone)]
@@ -146,7 +146,9 @@ impl Agent for ReActAgent {
                 // put in its answer, because it keys off a "name" field rather than
                 // off a successful parse.
                 let final_text = reply.trim().to_string();
-                let final_text = if is_effectively_empty(&final_text) {
+                let final_text = if is_effectively_empty(&final_text)
+                    || is_rejected_tool_call_blob(&final_text)
+                {
                     "the model stopped without producing an answer".to_string()
                 } else {
                     final_text
@@ -252,6 +254,19 @@ fn is_effectively_empty(text: &str) -> bool {
 mod tests {
     use super::*;
 
+    struct OneShotModel(String);
+
+    #[async_trait]
+    impl Model for OneShotModel {
+        fn name(&self) -> &str {
+            "one-shot"
+        }
+
+        async fn chat(&self, _req: ChatRequest) -> Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
     #[test]
     fn short_input_is_returned_verbatim() {
         assert_eq!(truncate_to_bytes("hello", 100), "hello");
@@ -299,19 +314,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_blank_tool_name_ends_the_run_instead_of_dispatching() {
-        struct OneShotModel(String);
-
-        #[async_trait]
-        impl Model for OneShotModel {
-            fn name(&self) -> &str {
-                "one-shot"
-            }
-
-            async fn chat(&self, _req: ChatRequest) -> Result<String> {
-                Ok(self.0.clone())
-            }
-        }
-
         let agent = ReActAgent::new(
             Arc::new(OneShotModel(
                 "```json\n{\"name\": \"\", \"arguments\": {\"path\": \"x\"}}\n```".to_string(),
@@ -330,10 +332,28 @@ mod tests {
             "nothing should be dispatched"
         );
         assert_eq!(outcome.iterations, 1, "the run must stop on the first turn");
-        assert!(
-            outcome.final_text.contains("\"name\": \"\""),
-            "the raw reply must survive into final_text, got {:?}",
-            outcome.final_text
+        assert_eq!(
+            outcome.final_text, "the model stopped without producing an answer",
+            "a fenced rejected blob must not be surfaced as the answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rejected_blob_becomes_a_notice_rather_than_raw_json() {
+        let agent = ReActAgent::new(
+            Arc::new(OneShotModel(r#"{"name": "", "arguments": {}}"#.to_string())),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("do the thing", &ToolRegistry::new())
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            outcome.final_text,
+            "the model stopped without producing an answer"
         );
     }
 }

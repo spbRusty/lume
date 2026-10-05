@@ -91,6 +91,25 @@ pub fn strip_tool_calls(reply: &str) -> String {
     result.trim().to_string()
 }
 
+/// True when the reply is nothing but a tool-call-shaped object that was refused, such
+/// as the `{"name": "", "arguments": {}}` a 7b model emits when it loses the thread.
+///
+/// The tool-call keys are required so that a model answering with plain JSON, e.g.
+/// `{"a": 1}`, is still treated as a real answer rather than a failed call.
+pub fn is_rejected_tool_call_blob(reply: &str) -> bool {
+    let unfenced = reply.replace("```json", "").replace("```", "");
+    let trimmed = unfenced.trim();
+    if !trimmed.starts_with('{') || !parse_tool_calls(trimmed).is_empty() {
+        return false;
+    }
+    serde_json::from_str::<Value>(trimmed)
+        .ok()
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|map| {
+            map.contains_key("name") || map.contains_key("arguments") || map.contains_key("args")
+        })
+}
+
 /// Parse a single tool call element from JSON value.
 fn parse_tool_call_elem(elem: &Value, default_num: usize) -> Option<ToolCall> {
     // Try to get name
@@ -306,5 +325,42 @@ Here is what I found."#;
             calls[0].arguments,
             json!({"file": "hello.txt", "content": "hi"})
         );
+    }
+
+    #[test]
+    fn a_rejected_tool_call_blob_is_recognised() {
+        // Exactly what qwen2.5-coder:7b emitted after a successful write.
+        assert!(is_rejected_tool_call_blob(
+            r#"{"name": "", "arguments": {}}"#
+        ));
+    }
+
+    #[test]
+    fn plain_json_is_still_a_real_answer() {
+        assert!(!is_rejected_tool_call_blob(r#"{"a": 1}"#));
+    }
+
+    #[test]
+    fn a_dispatchable_call_is_not_a_blob() {
+        assert!(!is_rejected_tool_call_blob(
+            r#"{"name": "list_dir", "arguments": {"path": "."}}"#
+        ));
+    }
+
+    #[test]
+    fn prose_is_not_a_blob() {
+        assert!(!is_rejected_tool_call_blob("here is what I found"));
+    }
+
+    #[test]
+    fn a_fenced_rejected_blob_is_recognised_too() {
+        assert!(is_rejected_tool_call_blob(
+            "```json\n{\"name\": \"\", \"arguments\": {}}\n```"
+        ));
+    }
+
+    #[test]
+    fn a_fenced_real_answer_survives() {
+        assert!(!is_rejected_tool_call_blob("```json\n{\"a\": 1}\n```"));
     }
 }

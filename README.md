@@ -7,9 +7,12 @@ Written in Rust, with a two-tier orchestrator and Model Context Protocol (MCP) t
 integration.
 
 **Status: early.** The crate graph, the ReAct loop, the orchestrator, and MCP protocol
-handling are implemented and covered by 114 unit tests. `lume run` has been exercised
-against a live `qwen2.5-coder:1.5b`: the model requested `write_file` and the file landed
-on disk. `lume chat` and MCP server connection are not implemented. See
+handling are implemented and covered by 121 unit tests. `lume run` has been exercised
+against live `qwen2.5-coder:1.5b` and `qwen2.5-coder:7b`: the model requests `write_file`
+and the file lands on disk. Sampling is non-deterministic (`temperature` 0.7 by default),
+so tool-call quality varies between runs and a failed call is reported rather than hidden.
+One 7B turn costs roughly 9s once the weights are resident, and ~45s on the first run while
+4.7 GB loads into RAM. `lume chat` and MCP server connection are not implemented. See
 [Roadmap](#roadmap) for what actually works today.
 
 ## Why this exists
@@ -175,13 +178,14 @@ at a machine you care about, keep the workspace root narrow and do not run it as
 
 Roughly in order:
 
-- [ ] Ollama backend verified against a live `qwen2.5:7b` (it is verified against
-      `qwen2.5-coder:1.5b`)
+- [ ] Ollama backend verified against `qwen2.5:7b` (it is verified against
+      `qwen2.5-coder:1.5b` and `qwen2.5-coder:7b`)
 - [x] End-to-end ReAct run: prompt → tool call → tool result → effect on disk
-- [ ] A natural-language closing answer — the 1.5B model usually ends its turn with an
-      empty code fence instead of prose, so `final_text` falls back to a notice
-- [ ] Tighter tool discipline — the same 1.5B model tends to repeat a tool call it has
-      already had succeed, costing an extra round trip
+- [ ] A natural-language closing answer — neither local model reliably ends with prose;
+      1.5b emits an empty code fence and 7b an empty tool call, so `final_text` falls back
+      to a notice
+- [ ] Tighter tool discipline — both models repeat a tool call that already succeeded,
+      costing an extra round trip
 - [ ] `lume chat` — the interactive loop
 - [ ] Connect MCP servers for real; the transports and negotiation exist, but the CLI only
       lists configured servers and never opens one
