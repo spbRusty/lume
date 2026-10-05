@@ -1,0 +1,25 @@
+[package]
+name = "lume-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "lume"
+path = "src/main.rs"
+
+[dependencies]
+lume-core = { workspace = true }
+lume-llm = { workspace = true }
+lume-mcp = { workspace = true }
+lume-agent = { workspace = true }
+lume-orchestrator = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true
