@@ -1,0 +1,41 @@
+# Example Lume configuration.
+#
+# Copy to `lume.toml` and edit. Every field has a default, so the shortest
+# valid file is an empty one.
+
+ollama_url = "http://127.0.0.1:11434"
+
+# The "large" tier plans and decides; the "small" tier executes.
+# On a CPU-only machine the 7B model is roughly 3x slower per token than the
+# 1.5B one, so only genuinely hard tasks are worth paying for.
+large_model = "qwen2.5:7b"
+small_model = "qwen2.5-coder:1.5b"
+
+# ReAct loop stops here no matter what.
+max_iterations = 24
+
+# Assumed context window, used to decide when to compact history.
+# Keep in sync with whatever the served model actually reports.
+context_window = 8192
+
+# Tools are confined to this directory. Absolute paths outside it are refused.
+# workspace_root = "/home/vlad/projects"
+
+# --- Model Context Protocol servers --------------------------------------
+
+[[mcp_servers]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/vlad/projects"]
+
+[[mcp_servers]]
+name = "git"
+transport = "stdio"
+command = "uvx"
+args = ["mcp-server-git", "--repository", "/home/vlad/projects"]
+
+# [[mcp_servers]]
+# name = "fetch"
+# transport = "http"
+# url = "http://127.0.0.1:8931/mcp"
