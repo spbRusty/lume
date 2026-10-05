@@ -141,7 +141,16 @@ impl Agent for ReActAgent {
             let calls = parse_tool_calls(&reply);
 
             if calls.is_empty() {
-                let final_text = strip_tool_calls(&reply).trim().to_string();
+                // Nothing parsed as a tool call, so there is nothing to strip: running
+                // the stripper here would silently delete JSON the model legitimately
+                // put in its answer, because it keys off a "name" field rather than
+                // off a successful parse.
+                let final_text = reply.trim().to_string();
+                let final_text = if is_effectively_empty(&final_text) {
+                    "the model stopped without producing an answer".to_string()
+                } else {
+                    final_text
+                };
                 let mut conv = self.conversation.lock().await;
                 conv.push(Message {
                     role: Role::Assistant,
@@ -232,6 +241,13 @@ pub(crate) fn truncate_to_bytes(input: &str, max_bytes: usize) -> String {
     out
 }
 
+fn is_effectively_empty(text: &str) -> bool {
+    text.replace("```json", "")
+        .replace("```", "")
+        .chars()
+        .all(|c| !c.is_alphanumeric())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +286,54 @@ mod tests {
     fn budget_larger_than_input_is_a_noop() {
         let out = truncate_to_bytes("abc", 9999);
         assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn an_empty_fence_is_not_treated_as_an_answer() {
+        assert!(is_effectively_empty("```json\n\n```"));
+        assert!(is_effectively_empty("   \n "));
+        assert!(is_effectively_empty(""));
+        assert!(!is_effectively_empty("done"));
+        assert!(!is_effectively_empty("42 files written"));
+    }
+
+    #[tokio::test]
+    async fn a_blank_tool_name_ends_the_run_instead_of_dispatching() {
+        struct OneShotModel(String);
+
+        #[async_trait]
+        impl Model for OneShotModel {
+            fn name(&self) -> &str {
+                "one-shot"
+            }
+
+            async fn chat(&self, _req: ChatRequest) -> Result<String> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let agent = ReActAgent::new(
+            Arc::new(OneShotModel(
+                "```json\n{\"name\": \"\", \"arguments\": {\"path\": \"x\"}}\n```".to_string(),
+            )),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("do the thing", &ToolRegistry::new())
+            .await
+            .expect("a blank name must not fail the run");
+
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "nothing should be dispatched"
+        );
+        assert_eq!(outcome.iterations, 1, "the run must stop on the first turn");
+        assert!(
+            outcome.final_text.contains("\"name\": \"\""),
+            "the raw reply must survive into final_text, got {:?}",
+            outcome.final_text
+        );
     }
 }

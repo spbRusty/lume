@@ -166,8 +166,21 @@ mod tests {
         path
     }
 
+    /// Every test here goes through `resolve`, which reads process-wide environment
+    /// variables, and one of them writes `LUME_SMALL_MODEL`. Without this lock that
+    /// writer can land between a sibling's read and its assertion, which is a race the
+    /// test harness runs freely because it executes tests on parallel threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     #[test]
     fn resolve_reads_a_toml_file() {
+        let _guard = env_guard();
         let path = temp_config(
             "basic",
             "small_model = \"qwen2.5:3b\"\nmax_iterations = 7\n",
@@ -181,9 +194,10 @@ mod tests {
 
     #[test]
     fn resolve_layers_env_over_file_values() {
+        let _guard = env_guard();
         let path = temp_config("layered", "small_model = \"from-file\"\n");
-        // SAFETY: `LUME_SMALL_MODEL` is read and written by no other test in this
-        // binary, so no other thread can observe it mid-flight.
+        // SAFETY: holding `env_guard` means no sibling test in this binary can read or
+        // write the process environment concurrently.
         unsafe { env::set_var("LUME_SMALL_MODEL", "from-env") };
         let cfg = LumeConfig::resolve(Some(&path)).expect("resolve");
         // SAFETY: as above.
@@ -194,6 +208,7 @@ mod tests {
 
     #[test]
     fn resolve_without_a_path_uses_defaults() {
+        let _guard = env_guard();
         let cfg = LumeConfig::resolve(None).expect("resolve");
         assert_eq!(cfg.ollama_url, default_ollama_url());
         assert_eq!(cfg.max_iterations, default_max_iterations());

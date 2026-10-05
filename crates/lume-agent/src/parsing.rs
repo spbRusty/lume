@@ -105,6 +105,13 @@ fn parse_tool_call_elem(elem: &Value, default_num: usize) -> Option<ToolCall> {
         .map(|s| s.to_string());
 
     let name = name?;
+    // A blank name would reach dispatch and fail there with an opaque
+    // "tool not found: ", hiding the fact that the model emitted nothing usable.
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let name = name.to_string();
 
     // Get arguments
     let arguments = elem
@@ -256,5 +263,48 @@ Here is what I found."#;
         assert!(stripped.contains("Let me look up the file"));
         assert!(stripped.contains("Here is what I found"));
         assert!(!stripped.contains("read_file"));
+    }
+
+    #[test]
+    fn blank_name_is_dropped() {
+        let reply = r#"[
+            {"name": "", "arguments": {"path": "a"}},
+            {"name": "   ", "arguments": {"path": "b"}},
+            {"name": "list_dir", "arguments": {"path": "."}}
+        ]"#;
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "list_dir");
+    }
+
+    #[test]
+    fn fenced_json_block_from_a_real_qwen_reply_is_parsed() {
+        let reply = "```json\n{\n  \"name\": \"write_file\",\n  \"arguments\": {\n    \"path\": \"hello.txt\",\n    \"content\": \"hi\"\n  }\n}\n```";
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(
+            calls[0].arguments,
+            json!({"path": "hello.txt", "content": "hi"})
+        );
+        assert_eq!(calls[0].id, "call_1");
+    }
+
+    #[test]
+    fn a_reply_that_is_only_prose_yields_no_calls() {
+        let reply = "I could not do that. Here is a JSON sketch instead: {\"a\": 1}";
+        assert!(parse_tool_calls(reply).is_empty());
+    }
+
+    #[test]
+    fn arguments_encoded_as_a_json_string_are_decoded() {
+        let reply = r#"{"name": "write_file", "arguments": "{\"file\": \"hello.txt\", \"content\": \"hi\"}"}"#;
+        let calls = parse_tool_calls(reply);
+        assert_eq!(calls.len(), 1, "parsed {calls:?}");
+        assert_eq!(calls[0].name, "write_file");
+        assert_eq!(
+            calls[0].arguments,
+            json!({"file": "hello.txt", "content": "hi"})
+        );
     }
 }

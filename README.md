@@ -7,9 +7,10 @@ Written in Rust, with a two-tier orchestrator and Model Context Protocol (MCP) t
 integration.
 
 **Status: early.** The crate graph, the ReAct loop, the orchestrator, and MCP protocol
-handling are implemented and covered by 91 unit tests. `lume run` is wired end to end but
-has **not** been verified against a live model yet, and `lume chat` plus MCP server
-connection are not implemented. See [Roadmap](#roadmap) for what actually works today.
+handling are implemented and covered by 114 unit tests. `lume run` has been exercised
+against a live `qwen2.5-coder:1.5b`: the model requested `write_file` and the file landed
+on disk. `lume chat` and MCP server connection are not implemented. See
+[Roadmap](#roadmap) for what actually works today.
 
 ## Why this exists
 
@@ -132,7 +133,7 @@ cargo run --release -p lume-cli -- doctor
 # What is actually served by your local ollama.
 cargo run --release -p lume-cli -- models
 
-# One-shot task through the orchestrator (not yet verified against a live model).
+# One-shot task through the orchestrator (verified against a live qwen2.5-coder:1.5b).
 cargo run --release -p lume-cli -- run "summarise the public API of src/"
 
 # Pin both tiers to one model instead of letting the router choose.
@@ -174,8 +175,13 @@ at a machine you care about, keep the workspace root narrow and do not run it as
 
 Roughly in order:
 
-- [ ] Ollama backend verified against a live `qwen2.5:7b`
-- [ ] End-to-end ReAct run: prompt → tool call → result → answer
+- [ ] Ollama backend verified against a live `qwen2.5:7b` (it is verified against
+      `qwen2.5-coder:1.5b`)
+- [x] End-to-end ReAct run: prompt → tool call → tool result → effect on disk
+- [ ] A natural-language closing answer — the 1.5B model usually ends its turn with an
+      empty code fence instead of prose, so `final_text` falls back to a notice
+- [ ] Tighter tool discipline — the same 1.5B model tends to repeat a tool call it has
+      already had succeed, costing an extra round trip
 - [ ] `lume chat` — the interactive loop
 - [ ] Connect MCP servers for real; the transports and negotiation exist, but the CLI only
       lists configured servers and never opens one
