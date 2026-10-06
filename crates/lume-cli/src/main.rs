@@ -3,6 +3,7 @@
 mod chat;
 mod probe;
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,10 +19,11 @@ use lume_agent::{
 };
 use lume_core::Tool;
 use lume_core::config::LumeConfig;
-use lume_core::types::SamplingParams;
+use lume_core::model::{Model, ModelTier};
+use lume_core::types::{ChatRequest, Message, Role, SamplingParams};
 use lume_llm::OllamaBackend;
 use lume_mcp::{DEFAULT_CONNECT_TIMEOUT, McpServerConnection};
-use lume_orchestrator::{Orchestrator, RetryPolicy, TokenBudget};
+use lume_orchestrator::{Orchestrator, RetryPolicy, TokenBudget, classify, tier_for};
 
 use crate::chat::chat;
 use crate::probe::{ServerProbe, probe};
@@ -55,6 +57,12 @@ enum Command {
         /// Seconds one phase of an MCP connection may take
         #[arg(long, default_value_t = DEFAULT_CONNECT_TIMEOUT.as_secs())]
         timeout: u64,
+        /// Stream the model's reply to stdout as it is generated
+        ///
+        /// Sends the task to the chosen model as a single completion — no
+        /// orchestrator, no tools — and prints every chunk as it arrives.
+        #[arg(long)]
+        stream: bool,
     },
     /// Chat interactively
     Chat {
@@ -119,13 +127,18 @@ async fn main() -> Result<()> {
             model,
             config,
             timeout,
+            stream,
         } => {
             let cfg = LumeConfig::resolve(config.as_deref())?;
-            let root = workspace_root(&cfg)?;
             let (small_model, large_model) = match &model {
                 Some(only) => (only.clone(), only.clone()),
                 None => (cfg.small_model.clone(), cfg.large_model.clone()),
             };
+            if stream {
+                run_streamed(&task, &cfg, small_model, large_model).await?;
+                return Ok(());
+            }
+            let root = workspace_root(&cfg)?;
             let (mut tools, connections) = with_mcp_tools(registry(root), &cfg, timeout).await;
             let orchestrator = Orchestrator::new(
                 Arc::new(OllamaBackend::new(&cfg.ollama_url, &large_model)),
@@ -245,6 +258,59 @@ fn workspace_root(cfg: &LumeConfig) -> Result<PathBuf> {
     }
 }
 
+/// Stream one completion for `task` straight to stdout as it arrives.
+///
+/// `--stream` is a direct line to the model: the task is sent as a single user
+/// message with no orchestrator and no tools, and every chunk is written and
+/// flushed the moment it lands, so output appears while the model is still
+/// generating. The tier the router would have picked for the task chooses the
+/// model, so a streamed run and a normal run route the same way.
+async fn run_streamed(
+    task: &str,
+    cfg: &LumeConfig,
+    small_model: String,
+    large_model: String,
+) -> Result<()> {
+    let model = match tier_for(classify(task)) {
+        ModelTier::Small => small_model,
+        ModelTier::Large => large_model,
+    };
+    let backend = OllamaBackend::new(&cfg.ollama_url, &model);
+    let request = ChatRequest {
+        model,
+        messages: vec![Message {
+            role: Role::User,
+            content: task.to_string(),
+            ..Default::default()
+        }],
+        tools: Vec::new(),
+        params: SamplingParams {
+            temperature: cfg.temperature,
+            seed: cfg.seed,
+            ..SamplingParams::default()
+        },
+    };
+
+    let mut chunks = backend.chat_stream(request).await?;
+    let mut stdout = std::io::stdout();
+    let mut usage = None;
+    while let Some(chunk) = chunks.recv().await {
+        if let Some(delta) = chunk.delta {
+            stdout.write_all(delta.as_bytes())?;
+            stdout.flush()?;
+        }
+        usage = chunk.usage.or(usage);
+    }
+    writeln!(stdout)?;
+    if let Some(usage) = usage {
+        println!(
+            "--- {} prompt + {} completion tokens ---",
+            usage.prompt_tokens, usage.completion_tokens
+        );
+    }
+    Ok(())
+}
+
 fn registry(root: PathBuf) -> ToolRegistry {
     let mut tools = ToolRegistry::new();
     tools.register_many([
@@ -361,7 +427,9 @@ fn indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::indent;
+    use clap::Parser;
+
+    use super::{Cli, Command, indent};
 
     #[test]
     fn indentation_pads_every_line_of_a_result() {
@@ -374,5 +442,29 @@ mod tests {
     #[test]
     fn an_empty_result_says_so_instead_of_printing_nothing() {
         assert_eq!(indent(""), "(no text content)");
+    }
+
+    #[test]
+    fn run_accepts_the_stream_flag() {
+        let cli = Cli::try_parse_from(["lume", "run", "--stream", "fix the typo"])
+            .expect("the flag parses");
+
+        match cli.command {
+            Command::Run { task, stream, .. } => {
+                assert_eq!(task, "fix the typo");
+                assert!(stream);
+            }
+            _ => panic!("expected the run subcommand"),
+        }
+    }
+
+    #[test]
+    fn run_streams_only_when_asked() {
+        let cli = Cli::try_parse_from(["lume", "run", "fix the typo"]).expect("parses");
+
+        match cli.command {
+            Command::Run { stream, .. } => assert!(!stream),
+            _ => panic!("expected the run subcommand"),
+        }
     }
 }

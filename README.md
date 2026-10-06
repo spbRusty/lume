@@ -7,7 +7,7 @@ Written in Rust, with a two-tier orchestrator and Model Context Protocol (MCP) t
 integration.
 
 **Status: early.** The crate graph, the ReAct loop, the orchestrator, and MCP protocol
-handling are implemented and covered by 161 unit tests. `lume run` has been exercised
+handling are implemented and covered by 210 unit tests. `lume run` has been exercised
 against live `qwen2.5-coder:1.5b` and `qwen2.5-coder:7b`: the model requests `write_file`
 and the file lands on disk. Sampling is non-deterministic (`temperature` 0.7 by default),
 so tool-call quality varies between runs and a failed call is reported rather than hidden.
@@ -198,22 +198,21 @@ Roughly in order:
 - [ ] Ollama backend verified against `qwen2.5:7b` (it is verified against
       `qwen2.5-coder:1.5b` and `qwen2.5-coder:7b`)
 - [x] End-to-end ReAct run: prompt → tool call → tool result → effect on disk
-- [ ] A natural-language closing answer — neither local model reliably ends with prose;
-      1.5b emits an empty code fence and 7b an empty tool call, so `final_text` falls back
-      to a notice
+- [x] A natural-language closing answer — degenerate final replies are summarised from
+      the tool calls the run actually made
 - [ ] Tighter tool discipline — both models repeat a tool call that already succeeded,
       costing an extra round trip
 - [x] `lume chat` — the interactive loop with history accumulation
 - [x] Connect MCP servers for real — stdio and HTTP transports, negotiation, tool registry,
       and live `mcp probe` verified against `@modelcontextprotocol/server-filesystem`
-- [ ] Real token accounting — `TokenBudget` currently estimates from the final answer text
-      rather than reading usage from the backend, so it ignores prompts and tool output
-- [ ] `openai_compatible` backend — llama.cpp, vLLM, LM Studio, and llamafile all speak
-      this protocol, so one backend covers every non-ollama local runtime and lets the
-      harness talk to a GGUF directly without a daemon in the middle
+- [x] Real token accounting — `TokenBudget` charges `prompt_eval_count + eval_count`
+      reported by the backend, falling back to a text estimate only when a backend
+      does not report usage
+- [x] `openai_compatible` backend — `OpenAiBackend` speaks `/chat/completions`, covering
+      llama.cpp, vLLM, LM Studio, and llamafile
 - [ ] llama.cpp FFI backend for in-process inference, bypassing HTTP entirely
-- [ ] Streaming wired through the CLI for incremental output
-- [ ] Smarter routing — replace the deterministic heuristic with a cheap classifier
+- [x] Streaming wired through the CLI — `lume run --stream` prints chunks as they arrive
+- [x] Smarter routing — weighted lexical classifier replaces the bare heuristic
 - [ ] Conversation persistence and session resume
 - [ ] Integration tests against recorded transcripts
 

@@ -152,7 +152,7 @@ impl Agent for ReActAgent {
                 let final_text = if is_effectively_empty(&final_text)
                     || is_rejected_tool_call_blob(&final_text)
                 {
-                    "the model stopped without producing an answer".to_string()
+                    closing_answer(&tool_calls_made)
                 } else {
                     final_text
                 };
@@ -253,9 +253,48 @@ fn is_effectively_empty(text: &str) -> bool {
         .all(|c| !c.is_alphanumeric())
 }
 
+/// Build the closing answer for a run whose final reply carried no usable prose.
+///
+/// A local model often ends a task with an empty code fence or a rejected tool-call
+/// blob, even though the loop already did real work. When no tools ran there is
+/// genuinely nothing to report and the placeholder stands. Otherwise the recorded
+/// `name(arguments)` calls are summarised: a single call is echoed verbatim, several
+/// are grouped by tool name with counts.
+///
+/// The wording only claims what the loop observed — which tools ran and how often —
+/// never an outcome it cannot see, so a `write_file` that ran is reported as having
+/// run, not as having written anything.
+fn closing_answer(tool_calls: &[String]) -> String {
+    match tool_calls {
+        [] => "the model stopped without producing an answer".to_string(),
+        [only] => only.clone(),
+        _ => {
+            let mut groups: Vec<(&str, usize)> = Vec::new();
+            for call in tool_calls {
+                // The recorder writes `name(arguments)`, so the name ends at the
+                // first parenthesis.
+                let name = call.split_once('(').map_or(call.as_str(), |(n, _)| n);
+                match groups.iter().position(|(seen, _)| *seen == name) {
+                    Some(idx) => groups[idx].1 += 1,
+                    None => groups.push((name, 1)),
+                }
+            }
+            let breakdown = groups
+                .iter()
+                .map(|(name, count)| format!("{name} x{count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("Ran {} tool call(s): {breakdown}.", tool_calls.len())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as SyncMutex;
+
+    use lume_core::Tool;
+    use lume_core::types::ToolSpec;
 
     use super::*;
 
@@ -290,6 +329,89 @@ mod tests {
         async fn chat(&self, req: ChatRequest) -> Result<String> {
             self.seen.lock().expect("recorder poisoned").push(req);
             Ok(self.reply.clone())
+        }
+    }
+
+    /// A `Model` that plays back a fixed sequence of replies, one per turn, so a
+    /// test can drive the loop through a real tool call and then a degenerate
+    /// final answer.
+    struct ScriptedModel {
+        replies: Vec<String>,
+        seen: SyncMutex<Vec<ChatRequest>>,
+    }
+
+    impl ScriptedModel {
+        /// A stub that answers turn *n* with `replies[n]`, repeating the last
+        /// reply if the script runs out so a runaway loop still terminates.
+        fn scripted(replies: &[&str]) -> Self {
+            Self {
+                replies: replies.iter().map(|s| s.to_string()).collect(),
+                seen: SyncMutex::new(Vec::new()),
+            }
+        }
+
+        /// Every request this stub was handed, in call order.
+        fn seen(&self) -> Vec<ChatRequest> {
+            self.seen.lock().expect("recorder poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl Model for ScriptedModel {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        async fn chat(&self, req: ChatRequest) -> Result<String> {
+            let mut seen = self.seen.lock().expect("recorder poisoned");
+            let turn = seen.len();
+            seen.push(req);
+            let reply = self
+                .replies
+                .get(turn)
+                .or_else(|| self.replies.last())
+                .cloned()
+                .unwrap_or_else(|| String::from("done"));
+            Ok(reply)
+        }
+    }
+
+    /// A tool that only counts its own invocations, so a test can assert the loop
+    /// really dispatched a call rather than merely recording one.
+    struct CountingTool {
+        spec: ToolSpec,
+        calls: Arc<SyncMutex<usize>>,
+    }
+
+    impl CountingTool {
+        /// A stub tool registered under `name`.
+        fn named(name: &str) -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: name.to_string(),
+                    description: "test double".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                calls: Arc::new(SyncMutex::new(0)),
+            }
+        }
+
+        /// A handle on the call counter, grabbed before the tool is boxed.
+        fn counter(&self) -> Arc<SyncMutex<usize>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for CountingTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> Result<String> {
+            let mut calls = self.calls.lock().expect("counter poisoned");
+            *calls += 1;
+            Ok("ok".to_string())
         }
     }
 
@@ -440,5 +562,131 @@ mod tests {
             SamplingParams::default().temperature,
             "leaving the config at default must not change what the model is sent"
         );
+    }
+
+    #[tokio::test]
+    async fn a_degenerate_final_reply_after_a_tool_call_summarises_that_call() {
+        let tool = CountingTool::named("write_file");
+        let counter = tool.counter();
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(tool));
+
+        let agent = ReActAgent::new(
+            Arc::new(ScriptedModel::scripted(&[
+                r#"{"name": "write_file", "arguments": {"path": "a.txt"}}"#,
+                "```json\n\n```",
+            ])),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("write a file", &tools)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            *counter.lock().expect("counter poisoned"),
+            1,
+            "the tool must really run, not merely be recorded"
+        );
+        assert_eq!(
+            outcome.tool_calls,
+            vec![r#"write_file({"path":"a.txt"})"#.to_string()]
+        );
+        assert_eq!(
+            outcome.final_text, r#"write_file({"path":"a.txt"})"#,
+            "an empty fence after a real call must yield a summary of that call"
+        );
+        assert_ne!(
+            outcome.final_text,
+            "the model stopped without producing an answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degenerate_final_reply_after_several_tool_calls_counts_them() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::named("write_file")));
+        tools.register(Box::new(CountingTool::named("read_file")));
+
+        let agent = ReActAgent::new(
+            Arc::new(ScriptedModel::scripted(&[
+                r#"[
+                    {"name": "write_file", "arguments": {"path": "a.txt"}},
+                    {"name": "write_file", "arguments": {"path": "b.txt"}},
+                    {"name": "read_file", "arguments": {"path": "a.txt"}}
+                ]"#,
+                r#"{"name": "", "arguments": {}}"#,
+            ])),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("do the work", &tools)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(outcome.tool_calls.len(), 3, "all three calls ran");
+        assert_eq!(
+            outcome.final_text, "Ran 3 tool call(s): write_file x2, read_file x1.",
+            "calls must be grouped by tool name with counts, in first-appearance order"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_degenerate_final_reply_with_no_tool_calls_keeps_the_placeholder() {
+        let agent = ReActAgent::new(
+            Arc::new(ScriptedModel::scripted(&["```json\n\n```"])),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("just answer", &ToolRegistry::new())
+            .await
+            .expect("run should succeed");
+
+        assert!(
+            outcome.tool_calls.is_empty(),
+            "nothing ran, so there is nothing to summarise"
+        );
+        assert_eq!(
+            outcome.final_text,
+            "the model stopped without producing an answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_final_reply_after_tool_calls_is_left_untouched() {
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool::named("read_file")));
+
+        let model = Arc::new(ScriptedModel::scripted(&[
+            r#"{"name": "read_file", "arguments": {"path": "src/main.rs"}}"#,
+            "Read src/main.rs; it defines the entry point.",
+        ]));
+        let agent = ReActAgent::new(
+            Arc::clone(&model) as Arc<dyn Model>,
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("what is in main.rs?", &tools)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            model.seen().len(),
+            2,
+            "one tool turn plus one answering turn"
+        );
+        assert_eq!(
+            outcome.final_text, "Read src/main.rs; it defines the entry point.",
+            "a usable final reply must pass through unmodified"
+        );
+        assert_eq!(outcome.tool_calls.len(), 1);
     }
 }
