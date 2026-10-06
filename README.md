@@ -7,7 +7,7 @@ Written in Rust, with a two-tier orchestrator and Model Context Protocol (MCP) t
 integration.
 
 **Status: early.** The crate graph, the ReAct loop, the orchestrator, and MCP protocol
-handling are implemented and covered by 210 unit tests. `lume run` has been exercised
+handling are implemented and covered by 216 unit tests. `lume run` has been exercised
 against live `qwen2.5-coder:1.5b` and `qwen2.5-coder:7b`: the model requests `write_file`
 and the file lands on disk. Sampling is non-deterministic (`temperature` 0.7 by default),
 so tool-call quality varies between runs and a failed call is reported rather than hidden.
@@ -200,8 +200,8 @@ Roughly in order:
 - [x] End-to-end ReAct run: prompt → tool call → tool result → effect on disk
 - [x] A natural-language closing answer — degenerate final replies are summarised from
       the tool calls the run actually made
-- [ ] Tighter tool discipline — both models repeat a tool call that already succeeded,
-      costing an extra round trip
+- [x] Tighter tool discipline — repeated successful tool calls are short-circuited
+      from a per-run cache instead of re-executed
 - [x] `lume chat` — the interactive loop with history accumulation
 - [x] Connect MCP servers for real — stdio and HTTP transports, negotiation, tool registry,
       and live `mcp probe` verified against `@modelcontextprotocol/server-filesystem`

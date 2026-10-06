@@ -10,6 +10,7 @@
 //! ChatML here as well would apply the template twice and corrupt the prompt. The
 //! renderer in `lume-llm` exists for backends that take a raw prompt instead.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -92,6 +93,13 @@ impl Agent for ReActAgent {
     async fn run(&self, prompt: &str, tools: &ToolRegistry) -> Result<AgentOutcome> {
         let mut iterations = 0usize;
         let mut tool_calls_made: Vec<String> = Vec::new();
+
+        // Successful tool calls already made during THIS run, keyed by
+        // `(tool name, canonical arguments)` and mapped to the result they
+        // produced. It is deliberately local to `run`: a later run must talk to
+        // whatever state exists then, not replay a success recorded earlier.
+        // Failures are never inserted, so the model can retry them.
+        let mut successful_calls: HashMap<(String, String), String> = HashMap::new();
 
         if !prompt.trim().is_empty() {
             let mut conv = self.conversation.lock().await;
@@ -190,13 +198,32 @@ impl Agent for ReActAgent {
             for call in &calls {
                 tool_calls_made.push(format!("{}({})", call.name, call.arguments));
 
-                // A failing tool must not kill the run: the model is told what went
-                // wrong and gets a chance to adapt on the next turn.
-                let content = match tools.dispatch(call).await {
-                    Ok(output) => truncate_to_bytes(&output, self.config.max_tool_output_bytes),
-                    Err(err) => {
-                        warn!(tool = %call.name, error = %err, "tool call failed");
-                        format!("tool error: {err}")
+                let cache_key = (
+                    call.name.clone(),
+                    canonical_arguments(&call.arguments.to_string()),
+                );
+                let cached = successful_calls.get(&cache_key).cloned();
+
+                let content = if let Some(previous) = cached {
+                    debug!(tool = %call.name, "repeated tool call served from cache");
+                    format!(
+                        "[This tool was already called with these arguments. The previous result was:]\n{previous}"
+                    )
+                } else {
+                    match tools.dispatch(call).await {
+                        Ok(output) => {
+                            let output =
+                                truncate_to_bytes(&output, self.config.max_tool_output_bytes);
+                            successful_calls.insert(cache_key, output.clone());
+                            output
+                        }
+                        // A failing tool must not kill the run: the model is told what
+                        // went wrong and gets a chance to adapt on the next turn. The
+                        // failure is not cached, so that retry really dispatches again.
+                        Err(err) => {
+                            warn!(tool = %call.name, error = %err, "tool call failed");
+                            format!("tool error: {err}")
+                        }
                     }
                 };
 
@@ -244,6 +271,50 @@ pub(crate) fn truncate_to_bytes(input: &str, max_bytes: usize) -> String {
     out.push_str(&input[..cut]);
     out.push_str(MARKER);
     out
+}
+
+/// Canonicalise a tool call's raw argument JSON for use as a repeat-call cache key.
+///
+/// The model can express one logical call several ways — different key order,
+/// extra whitespace — so the text is re-parsed and rewritten with sorted object
+/// keys and no whitespace before it is used as a key. Text that does not parse
+/// is kept verbatim, so even an odd payload still deduplicates against itself.
+fn canonical_arguments(raw: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(value) => canonical_form(&value),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Serialise `value` with sorted object keys and no insignificant whitespace.
+fn canonical_form(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort_unstable();
+            let body = keys
+                .iter()
+                .map(|key| {
+                    format!(
+                        "{}:{}",
+                        serde_json::Value::String((*key).clone()),
+                        canonical_form(&map[*key])
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{{body}}}")
+        }
+        serde_json::Value::Array(items) => format!(
+            "[{}]",
+            items
+                .iter()
+                .map(canonical_form)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        other => other.to_string(),
+    }
 }
 
 fn is_effectively_empty(text: &str) -> bool {
@@ -412,6 +483,48 @@ mod tests {
             let mut calls = self.calls.lock().expect("counter poisoned");
             *calls += 1;
             Ok("ok".to_string())
+        }
+    }
+
+    /// A tool that always fails while counting its own invocations, so a test
+    /// can assert that a failed call is not cached and a retry dispatches again.
+    struct FailingTool {
+        spec: ToolSpec,
+        calls: Arc<SyncMutex<usize>>,
+    }
+
+    impl FailingTool {
+        /// A stub tool registered under `name` that fails every call.
+        fn named(name: &str) -> Self {
+            Self {
+                spec: ToolSpec {
+                    name: name.to_string(),
+                    description: "failing test double".to_string(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                calls: Arc::new(SyncMutex::new(0)),
+            }
+        }
+
+        /// A handle on the call counter, grabbed before the tool is boxed.
+        fn counter(&self) -> Arc<SyncMutex<usize>> {
+            Arc::clone(&self.calls)
+        }
+    }
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn spec(&self) -> ToolSpec {
+            self.spec.clone()
+        }
+
+        async fn call(&self, _args: serde_json::Value) -> Result<String> {
+            let mut calls = self.calls.lock().expect("counter poisoned");
+            *calls += 1;
+            Err(LumeError::ToolFailed {
+                name: self.spec.name.clone(),
+                message: "boom".to_string(),
+            })
         }
     }
 
@@ -688,5 +801,194 @@ mod tests {
             "a usable final reply must pass through unmodified"
         );
         assert_eq!(outcome.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn canonical_arguments_sorts_keys_and_drops_whitespace() {
+        let first = canonical_arguments(r#"{"path": "a.txt", "content": "hi"}"#);
+        let second = canonical_arguments("{\n  \"content\": \"hi\",\n  \"path\": \"a.txt\"\n}");
+        assert_eq!(first, second, "key order and whitespace must not matter");
+        assert_eq!(first, r#"{"content":"hi","path":"a.txt"}"#);
+    }
+
+    #[test]
+    fn canonical_arguments_keeps_text_that_is_not_json_verbatim() {
+        assert_eq!(canonical_arguments("not json at all"), "not json at all");
+    }
+
+    #[tokio::test]
+    async fn a_repeated_successful_tool_call_is_short_circuited() {
+        let tool = CountingTool::named("write_file");
+        let counter = tool.counter();
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(tool));
+
+        let agent = ReActAgent::new(
+            Arc::new(ScriptedModel::scripted(&[
+                r#"{"name": "write_file", "arguments": {"path": "a.txt", "content": "hello"}}"#,
+                r#"{"name": "write_file", "arguments": {"path": "a.txt", "content": "hello"}}"#,
+                "Done: a.txt written once.",
+            ])),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("write a file", &tools)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            *counter.lock().expect("counter poisoned"),
+            1,
+            "the repeated call must not reach the tool a second time"
+        );
+        assert_eq!(
+            outcome.iterations, 3,
+            "both tool turns and the final answer still cost a turn each"
+        );
+        assert_eq!(
+            outcome.tool_calls.len(),
+            2,
+            "the model asked twice, so both asks are recorded"
+        );
+        assert_eq!(outcome.final_text, "Done: a.txt written once.");
+
+        let messages = agent.conversation.lock().await.messages();
+        let tool_results: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(tool_results.len(), 2, "one result per asked call");
+        assert_eq!(tool_results[0], "ok", "the first call really executed");
+        assert!(
+            tool_results[1].starts_with(
+                "[This tool was already called with these arguments. The previous result was:]"
+            ),
+            "the repeat must be answered from the cache, got: {}",
+            tool_results[1]
+        );
+        assert!(
+            tool_results[1].contains("ok"),
+            "the cached note must carry the original result, got: {}",
+            tool_results[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_tool_call_is_not_cached_so_a_retry_re_dispatches() {
+        let tool = FailingTool::named("write_file");
+        let counter = tool.counter();
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(tool));
+
+        let agent = ReActAgent::new(
+            Arc::new(ScriptedModel::scripted(&[
+                r#"{"name": "write_file", "arguments": {"path": "a.txt"}}"#,
+                r#"{"name": "write_file", "arguments": {"path": "a.txt"}}"#,
+                "Could not write the file.",
+            ])),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("write a file", &tools)
+            .await
+            .expect("a failing tool must not kill the run");
+
+        assert_eq!(
+            *counter.lock().expect("counter poisoned"),
+            2,
+            "a failure must not be cached: the retry has to dispatch again"
+        );
+        assert_eq!(outcome.final_text, "Could not write the file.");
+
+        let messages = agent.conversation.lock().await.messages();
+        let tool_results: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(tool_results.len(), 2);
+        for result in tool_results {
+            assert_eq!(
+                result, "tool error: tool failed: write_file - boom",
+                "both attempts must report the real failure, never a cache hit"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_with_different_arguments_is_dispatched_again() {
+        let tool = CountingTool::named("write_file");
+        let counter = tool.counter();
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(tool));
+
+        let agent = ReActAgent::new(
+            Arc::new(ScriptedModel::scripted(&[
+                r#"{"name": "write_file", "arguments": {"path": "a.txt"}}"#,
+                r#"{"name": "write_file", "arguments": {"path": "b.txt"}}"#,
+                "Both files written.",
+            ])),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("write two files", &tools)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            *counter.lock().expect("counter poisoned"),
+            2,
+            "only the arguments differ, so neither call may be short-circuited"
+        );
+        assert_eq!(outcome.final_text, "Both files written.");
+
+        let messages = agent.conversation.lock().await.messages();
+        let tool_results: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            tool_results,
+            ["ok", "ok"],
+            "both results come from dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_arguments_written_in_a_different_key_order_hit_the_cache() {
+        let tool = CountingTool::named("write_file");
+        let counter = tool.counter();
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(tool));
+
+        let agent = ReActAgent::new(
+            Arc::new(ScriptedModel::scripted(&[
+                r#"{"name": "write_file", "arguments": {"path": "a.txt", "content": "hi"}}"#,
+                r#"{"name": "write_file", "arguments": {"content": "hi", "path": "a.txt"}}"#,
+                "Written.",
+            ])),
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        let outcome = agent
+            .run("write a file", &tools)
+            .await
+            .expect("run should succeed");
+
+        assert_eq!(
+            *counter.lock().expect("counter poisoned"),
+            1,
+            "canonicalised arguments must collapse both spellings onto one key"
+        );
+        assert_eq!(outcome.final_text, "Written.");
     }
 }
