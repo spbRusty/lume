@@ -7,13 +7,13 @@ Written in Rust, with a two-tier orchestrator and Model Context Protocol (MCP) t
 integration.
 
 **Status: early.** The crate graph, the ReAct loop, the orchestrator, and MCP protocol
-handling are implemented and covered by 121 unit tests. `lume run` has been exercised
+handling are implemented and covered by 161 unit tests. `lume run` has been exercised
 against live `qwen2.5-coder:1.5b` and `qwen2.5-coder:7b`: the model requests `write_file`
 and the file lands on disk. Sampling is non-deterministic (`temperature` 0.7 by default),
 so tool-call quality varies between runs and a failed call is reported rather than hidden.
 One 7B turn costs roughly 9s once the weights are resident, and ~45s on the first run while
-4.7 GB loads into RAM. `lume chat` and MCP server connection are not implemented. See
-[Roadmap](#roadmap) for what actually works today.
+4.7 GB loads into RAM. `lume chat` and MCP server connection are implemented and verified
+against live models. See [Roadmap](#roadmap) for what actually works today.
 
 ## Why this exists
 
@@ -146,11 +146,28 @@ cargo run --release -p lume-cli -- run --model qwen2.5:7b "review this diff"
 cargo run --release -p lume-cli -- mcp list --config lume.toml
 ```
 
-`lume chat` is **not** implemented yet — it exits with a message pointing at `run`.
+`lume chat` is an interactive REPL that reuses one `ReActAgent` across turns, so
+conversation history accumulates. Type `/help` for commands, `/exit` or Ctrl-D to leave.
 
 Configuration comes from environment variables (see `.env.example`) or a TOML file
 (see `mcp.example.toml`). Environment variables win over file values, so a `LUME_*`
 variable always overrides the same key in the file.
+
+## Reproducibility
+
+Set `LUME_SEED` and optionally `LUME_TEMPERATURE` to make runs deterministic:
+
+```bash
+LUME_SEED=42 LUME_TEMPERATURE=0 cargo run --release -p lume-cli -- run "fix the typo in README"
+```
+
+`LUME_SEED` is passed to Ollama on every model turn. `LUME_TEMPERATURE=0` disables
+sampling. Both can also be set in `lume.toml`:
+
+```toml
+seed = 42
+temperature = 0
+```
 
 ## Safety model
 
@@ -186,9 +203,9 @@ Roughly in order:
       to a notice
 - [ ] Tighter tool discipline — both models repeat a tool call that already succeeded,
       costing an extra round trip
-- [ ] `lume chat` — the interactive loop
-- [ ] Connect MCP servers for real; the transports and negotiation exist, but the CLI only
-      lists configured servers and never opens one
+- [x] `lume chat` — the interactive loop with history accumulation
+- [x] Connect MCP servers for real — stdio and HTTP transports, negotiation, tool registry,
+      and live `mcp probe` verified against `@modelcontextprotocol/server-filesystem`
 - [ ] Real token accounting — `TokenBudget` currently estimates from the final answer text
       rather than reading usage from the backend, so it ignores prompts and tool output
 - [ ] `openai_compatible` backend — llama.cpp, vLLM, LM Studio, and llamafile all speak

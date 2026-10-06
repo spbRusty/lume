@@ -58,6 +58,12 @@ pub struct LumeConfig {
     /// Context window size.
     #[serde(default = "default_context_window")]
     pub context_window: usize,
+    /// Sampling temperature, `None` to keep the backend default.
+    #[serde(default)]
+    pub temperature: Option<f32>,
+    /// Sampling seed, `None` for a non-reproducible run.
+    #[serde(default)]
+    pub seed: Option<u64>,
     /// Workspace root.
     #[serde(default)]
     pub workspace_root: Option<PathBuf>,
@@ -94,6 +100,8 @@ impl Default for LumeConfig {
             large_model: default_large_model(),
             max_iterations: default_max_iterations(),
             context_window: default_context_window(),
+            temperature: None,
+            seed: None,
             workspace_root: None,
             mcp_servers: Vec::new(),
         }
@@ -120,6 +128,16 @@ impl LumeConfig {
         if let Ok(v) = env::var("LUME_CONTEXT_WINDOW") {
             if let Ok(n) = v.parse::<usize>() {
                 self.context_window = n;
+            }
+        }
+        if let Ok(v) = env::var("LUME_TEMPERATURE") {
+            if let Ok(t) = v.parse::<f32>() {
+                self.temperature = Some(t);
+            }
+        }
+        if let Ok(v) = env::var("LUME_SEED") {
+            if let Ok(n) = v.parse::<u64>() {
+                self.seed = Some(n);
             }
         }
         if let Ok(v) = env::var("LUME_WORKSPACE_ROOT") {
@@ -212,5 +230,92 @@ mod tests {
         let cfg = LumeConfig::resolve(None).expect("resolve");
         assert_eq!(cfg.ollama_url, default_ollama_url());
         assert_eq!(cfg.max_iterations, default_max_iterations());
+    }
+
+    #[test]
+    fn sampling_defaults_to_unset() {
+        let _guard = env_guard();
+        let cfg = LumeConfig::resolve(None).expect("resolve");
+        assert_eq!(cfg.temperature, None);
+        assert_eq!(cfg.seed, None);
+    }
+
+    #[test]
+    fn resolve_layers_sampling_env_over_file_values() {
+        let _guard = env_guard();
+        let path = temp_config("sampling-layered", "temperature = 0.1\nseed = 1\n");
+        // SAFETY: holding `env_guard` means no sibling test in this binary can read or
+        // write the process environment concurrently.
+        unsafe { env::set_var("LUME_TEMPERATURE", "0") };
+        unsafe { env::set_var("LUME_SEED", "42") };
+        let cfg = LumeConfig::resolve(Some(&path)).expect("resolve");
+        // SAFETY: as above.
+        unsafe { env::remove_var("LUME_TEMPERATURE") };
+        unsafe { env::remove_var("LUME_SEED") };
+        assert_eq!(cfg.temperature, Some(0.0));
+        assert_eq!(cfg.seed, Some(42));
+        fs::remove_file(&path).expect("remove temp config");
+    }
+
+    #[test]
+    fn resolve_reads_sampling_values_from_a_toml_file() {
+        let _guard = env_guard();
+        let path = temp_config("sampling-file", "temperature = 0.25\nseed = 7\n");
+        let cfg = LumeConfig::resolve(Some(&path)).expect("resolve");
+        assert_eq!(cfg.temperature, Some(0.25));
+        assert_eq!(cfg.seed, Some(7));
+        fs::remove_file(&path).expect("remove temp config");
+    }
+
+    #[test]
+    fn a_malformed_temperature_is_ignored_instead_of_panicking() {
+        let _guard = env_guard();
+        let path = temp_config("sampling-malformed", "temperature = 0.25\n");
+        // SAFETY: holding `env_guard` means no sibling test in this binary can read or
+        // write the process environment concurrently.
+        unsafe { env::set_var("LUME_TEMPERATURE", "warm") };
+        let cfg = LumeConfig::resolve(Some(&path)).expect("resolve");
+        // SAFETY: as above.
+        unsafe { env::remove_var("LUME_TEMPERATURE") };
+        assert_eq!(cfg.temperature, Some(0.25), "the file value must survive");
+        fs::remove_file(&path).expect("remove temp config");
+    }
+
+    #[test]
+    fn a_malformed_seed_is_ignored_instead_of_panicking() {
+        let _guard = env_guard();
+        let path = temp_config("seed-malformed", "seed = 7\n");
+        // SAFETY: holding `env_guard` means no sibling test in this binary can read or
+        // write the process environment concurrently.
+        unsafe { env::set_var("LUME_SEED", "-1") };
+        let cfg = LumeConfig::resolve(Some(&path)).expect("resolve");
+        // SAFETY: as above.
+        unsafe { env::remove_var("LUME_SEED") };
+        assert_eq!(cfg.seed, Some(7), "the file value must survive");
+        fs::remove_file(&path).expect("remove temp config");
+    }
+
+    #[test]
+    fn a_seed_set_only_in_the_environment_round_trips() {
+        let _guard = env_guard();
+        // SAFETY: holding `env_guard` means no sibling test in this binary can read or
+        // write the process environment concurrently.
+        unsafe { env::set_var("LUME_SEED", "1234567890123") };
+        let cfg = LumeConfig::from_env();
+        // SAFETY: as above.
+        unsafe { env::remove_var("LUME_SEED") };
+        assert_eq!(cfg.seed, Some(1234567890123));
+    }
+
+    #[test]
+    fn a_zero_temperature_in_the_environment_is_kept() {
+        let _guard = env_guard();
+        // SAFETY: holding `env_guard` means no sibling test in this binary can read or
+        // write the process environment concurrently.
+        unsafe { env::set_var("LUME_TEMPERATURE", "0") };
+        let cfg = LumeConfig::from_env();
+        // SAFETY: as above.
+        unsafe { env::remove_var("LUME_TEMPERATURE") };
+        assert_eq!(cfg.temperature, Some(0.0));
     }
 }

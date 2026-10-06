@@ -5,6 +5,16 @@
 //! Both paths exist because nearly every MCP server deployed today predates
 //! `server/discover`; a client that implemented only the new revision could not
 //! talk to anything actually running.
+//!
+//! Envelope `_meta` -- the `_meta` sibling of `jsonrpc`/`id`/`method` -- exists
+//! only to carry the revision and client capabilities per request, which the
+//! stateless revision needs because it has no handshake, so it is attached on
+//! that path alone (see [`McpClient::build_request`]). Real servers enforce the
+//! same rule from the other side: the published Go implementations of the
+//! official servers silently discard, without answering, *any* request carrying
+//! an envelope `_meta`, so attaching one to the legacy handshake hangs the client
+//! forever. The handshake already states those facts in its `initialize` params,
+//! which is where a `2025-06-18` server reads them.
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -89,14 +99,15 @@ impl McpClient {
 
     /// Negotiate the protocol revision, once per connection.
     ///
-    /// `server/discover` is tried first; a method-not-found answer means the
-    /// server predates the stateless revision, so the legacy `initialize` plus
-    /// `notifications/initialized` handshake runs instead.
+    /// `server/discover` is tried first; an answer that shows the server does not
+    /// implement it means the server predates the stateless revision, so the
+    /// legacy `initialize` plus `notifications/initialized` handshake runs
+    /// instead.
     pub async fn negotiate(&mut self) -> Result<NegotiatedProtocol> {
         if let Some(protocol) = &self.protocol {
             return Ok(protocol.clone());
         }
-        let probe = match self.request_result(SERVER_DISCOVER_METHOD, None).await {
+        let probe = match self.discover().await {
             Ok(payload) => {
                 DiscoverProbe::Answered(serde_json::from_value::<DiscoverResult>(payload)?)
             }
@@ -238,11 +249,44 @@ impl McpClient {
             )?),
             method: method.to_string(),
             params,
-            meta: Some(
-                RequestMeta::new(self.revision(), &self.client_info, &self.capabilities)
-                    .to_value()?,
-            ),
+            meta: self.envelope_meta()?,
         })
+    }
+
+    /// Ask the server what revisions it speaks.
+    ///
+    /// Sent without envelope `_meta`, which the probe cannot use: the answer is
+    /// what establishes the revision, so a request that carries the stateless
+    /// revision's per-request metadata presumes the outcome it is asking for. A
+    /// server that has never heard of `server/discover` takes that presumption as
+    /// a stateless request and discards it unanswered, which is exactly the
+    /// request whose answer this method needs.
+    async fn discover(&mut self) -> Result<Value, RpcError> {
+        let request = JsonRpcRequest {
+            jsonrpc: JSONRPC_VERSION.to_string(),
+            id: Some(
+                serde_json::to_value(self.next_id.fetch_add(1, Ordering::SeqCst))
+                    .map_err(internal)?,
+            ),
+            method: SERVER_DISCOVER_METHOD.to_string(),
+            params: None,
+            meta: None,
+        };
+        self.dispatch(request).await
+    }
+
+    /// Envelope `_meta` for the revision in play, or `None` on the legacy path.
+    ///
+    /// From the legacy handshake onward the revision in play is `2025-06-18`,
+    /// which has no envelope `_meta` to read and whose published servers discard
+    /// requests that carry one.
+    fn envelope_meta(&self) -> Result<Option<Value>> {
+        if self.revision() != ProtocolRevision::Stateless2026_07_28 {
+            return Ok(None);
+        }
+        Ok(Some(
+            RequestMeta::new(self.revision(), &self.client_info, &self.capabilities).to_value()?,
+        ))
     }
 
     async fn request_result(
@@ -287,7 +331,9 @@ mod tests {
 
     use super::{CALL_TOOL_METHOD, LIST_TOOLS_METHOD, McpClient};
     use crate::capabilities::ClientInfo;
-    use crate::meta::{META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION};
+    use crate::meta::{
+        META_CLIENT_CAPABILITIES, META_CLIENT_INFO, META_PROTOCOL_VERSION, RequestMeta,
+    };
     use crate::negotiation::{
         INITIALIZE_METHOD, INITIALIZED_NOTIFICATION, ProtocolRevision, SERVER_DISCOVER_METHOD,
     };
@@ -376,17 +422,26 @@ mod tests {
         }))
     }
 
-    fn meta_protocol_versions(sent: &[JsonRpcRequest]) -> Vec<String> {
+    fn meta_protocol_versions(sent: &[JsonRpcRequest]) -> Vec<Option<String>> {
         sent.iter()
             .map(|req| {
                 req.meta
                     .as_ref()
                     .and_then(|meta| meta.get(META_PROTOCOL_VERSION))
                     .and_then(Value::as_str)
-                    .expect("every request declares its protocol version")
-                    .to_string()
+                    .map(str::to_string)
             })
             .collect()
+    }
+
+    fn meta_for(revision: ProtocolRevision) -> Value {
+        RequestMeta::new(
+            revision,
+            &ClientInfo::lume(),
+            &crate::capabilities::ClientCapabilities::default(),
+        )
+        .to_value()
+        .expect("serializable meta")
     }
 
     #[tokio::test]
@@ -418,12 +473,21 @@ mod tests {
                 .collect::<Vec<_>>(),
             [SERVER_DISCOVER_METHOD, LIST_TOOLS_METHOD]
         );
-        assert!(sent.iter().all(|req| {
-            req.meta.as_ref().is_some_and(|meta| {
-                meta.get(META_CLIENT_INFO).is_some() && meta.get(META_CLIENT_CAPABILITIES).is_some()
-            })
-        }));
-        assert_eq!(meta_protocol_versions(&sent), ["2026-07-28", "2026-07-28"]);
+        let meta = sent[1].meta.as_ref().expect("meta on a stateless request");
+        assert_eq!(
+            meta.as_object().expect("meta object"),
+            meta_for(ProtocolRevision::Stateless2026_07_28)
+                .as_object()
+                .expect("meta object")
+        );
+        assert_eq!(meta[META_PROTOCOL_VERSION], json!("2026-07-28"));
+        assert_eq!(meta[META_CLIENT_INFO]["name"], json!("lume"));
+        assert!(meta.get(META_CLIENT_CAPABILITIES).is_some());
+        assert_eq!(
+            meta_protocol_versions(&sent),
+            [None, Some("2026-07-28".to_string())],
+            "the probe cannot presume a revision, and everything after it is stateless"
+        );
     }
 
     #[tokio::test]
@@ -476,13 +540,12 @@ mod tests {
             json!("2025-06-18")
         );
         assert_eq!(sent[2].id, None, "the handshake notification has no id");
-        // The probe advertises the new revision, since asking whether the server
-        // supports it is the probe's whole purpose; everything from the legacy
-        // handshake onward must declare 2025-06-18 in both `_meta` and params.
-        assert_eq!(
-            meta_protocol_versions(&sent),
-            ["2026-07-28", "2025-06-18", "2025-06-18", "2025-06-18"]
-        );
+        // Nothing on this path carries an envelope `_meta`: the probe cannot
+        // presume the revision it is asking about, and `2025-06-18` defines no
+        // such field -- published servers discard requests that carry one instead
+        // of answering them. The same three facts travel in the `initialize` params
+        // asserted above, which is where a `2025-06-18` server reads them.
+        assert_eq!(meta_protocol_versions(&sent), [None, None, None, None]);
     }
 
     #[tokio::test]

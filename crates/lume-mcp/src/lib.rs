@@ -23,6 +23,10 @@ pub use client::McpClient;
 pub use meta::*;
 pub use negotiation::*;
 pub use protocol::*;
-pub use registry::{McpToolAdapter, ToolRegistry, collect_mcp_tools};
+pub use registry::{
+    DEFAULT_CONNECT_TIMEOUT, McpServerConnection, McpToolAdapter, NameCollision, ServerFailure,
+    ServerRegistration, ToolRegistry, collect_mcp_tools, connect_server, connect_servers,
+    transport_for,
+};
 pub use results::*;
 pub use transport::{HttpTransport, StdioTransport, Transport};

@@ -119,9 +119,18 @@ pub struct RpcError {
 }
 
 impl RpcError {
-    /// Whether the server rejected the method as unknown.
+    /// Whether the answer shows the server does not implement the method.
+    ///
+    /// `-32601` is the specified answer, but it is not the only one a deployed
+    /// server gives. The Python SDK matches an incoming request against the
+    /// union of the request types it knows, so a method it has never heard of --
+    /// `server/discover`, for every server released before the stateless revision
+    /// -- fails that match and is reported as `-32602`, invalid params: it could
+    /// not work out the params of a request type it has no definition for. Both
+    /// answers mean the same thing to a client that is only trying to find out
+    /// whether the method exists, which is all the `server/discover` probe is.
     pub fn is_method_not_found(&self) -> bool {
-        self.code == METHOD_NOT_FOUND
+        matches!(self.code, METHOD_NOT_FOUND | INVALID_PARAMS)
     }
 }
 
@@ -214,12 +223,30 @@ mod tests {
             .is_method_not_found()
         );
         assert!(
+            RpcError {
+                code: INVALID_PARAMS,
+                message: "Invalid request parameters".to_string(),
+                data: None,
+            }
+            .is_method_not_found(),
+            "a server that cannot match an unknown method reports invalid params"
+        );
+        assert!(
             !RpcError {
                 code: INTERNAL,
                 message: "boom".to_string(),
                 data: None,
             }
             .is_method_not_found()
+        );
+        assert!(
+            !RpcError {
+                code: UNSUPPORTED_PROTOCOL_VERSION,
+                message: "2026-07-28 is not supported".to_string(),
+                data: None,
+            }
+            .is_method_not_found(),
+            "a server that implements the method and dislikes the revision is a real error"
         );
     }
 

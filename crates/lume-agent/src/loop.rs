@@ -32,6 +32,8 @@ pub struct AgentConfig {
     /// Budget for a single tool result, in bytes. Longer output is truncated on a
     /// character boundary and marked, so the model can tell it was clipped.
     pub max_tool_output_bytes: usize,
+    /// Sampling parameters sent on every model turn.
+    pub params: SamplingParams,
 }
 
 impl Default for AgentConfig {
@@ -39,6 +41,7 @@ impl Default for AgentConfig {
         Self {
             max_iterations: 24,
             max_tool_output_bytes: 8192,
+            params: SamplingParams::default(),
         }
     }
 }
@@ -133,7 +136,7 @@ impl Agent for ReActAgent {
                     model: self.model.name().to_string(),
                     messages: conv.messages(),
                     tools: tools.specs(),
-                    params: SamplingParams::default(),
+                    params: self.config.params.clone(),
                 }
             };
 
@@ -252,9 +255,31 @@ fn is_effectively_empty(text: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as SyncMutex;
+
     use super::*;
 
-    struct OneShotModel(String);
+    /// A `Model` that answers every call with one fixed reply and records the
+    /// requests it was handed, so a test can assert on what the loop actually sent.
+    struct OneShotModel {
+        reply: String,
+        seen: SyncMutex<Vec<ChatRequest>>,
+    }
+
+    impl OneShotModel {
+        /// A stub that answers every call with `reply`.
+        fn answering(reply: &str) -> Self {
+            Self {
+                reply: reply.to_string(),
+                seen: SyncMutex::new(Vec::new()),
+            }
+        }
+
+        /// Every request this stub was handed, in call order.
+        fn seen(&self) -> Vec<ChatRequest> {
+            self.seen.lock().expect("recorder poisoned").clone()
+        }
+    }
 
     #[async_trait]
     impl Model for OneShotModel {
@@ -262,8 +287,9 @@ mod tests {
             "one-shot"
         }
 
-        async fn chat(&self, _req: ChatRequest) -> Result<String> {
-            Ok(self.0.clone())
+        async fn chat(&self, req: ChatRequest) -> Result<String> {
+            self.seen.lock().expect("recorder poisoned").push(req);
+            Ok(self.reply.clone())
         }
     }
 
@@ -315,8 +341,8 @@ mod tests {
     #[tokio::test]
     async fn a_blank_tool_name_ends_the_run_instead_of_dispatching() {
         let agent = ReActAgent::new(
-            Arc::new(OneShotModel(
-                "```json\n{\"name\": \"\", \"arguments\": {\"path\": \"x\"}}\n```".to_string(),
+            Arc::new(OneShotModel::answering(
+                "```json\n{\"name\": \"\", \"arguments\": {\"path\": \"x\"}}\n```",
             )),
             Conversation::new(4096),
             AgentConfig::default(),
@@ -341,7 +367,7 @@ mod tests {
     #[tokio::test]
     async fn a_rejected_blob_becomes_a_notice_rather_than_raw_json() {
         let agent = ReActAgent::new(
-            Arc::new(OneShotModel(r#"{"name": "", "arguments": {}}"#.to_string())),
+            Arc::new(OneShotModel::answering(r#"{"name": "", "arguments": {}}"#)),
             Conversation::new(4096),
             AgentConfig::default(),
         );
@@ -354,6 +380,65 @@ mod tests {
         assert_eq!(
             outcome.final_text,
             "the model stopped without producing an answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_configured_sampling_params_reach_the_model() {
+        let model = Arc::new(OneShotModel::answering("done"));
+        let agent = ReActAgent::new(
+            Arc::clone(&model) as Arc<dyn Model>,
+            Conversation::new(4096),
+            AgentConfig {
+                params: SamplingParams {
+                    temperature: Some(0.05),
+                    seed: Some(987_654_321),
+                    ..SamplingParams::default()
+                },
+                ..AgentConfig::default()
+            },
+        );
+
+        agent
+            .run("fix typo", &ToolRegistry::new())
+            .await
+            .expect("run should succeed");
+
+        let seen = model.seen();
+        assert_eq!(seen.len(), 1, "one turn, one recorded request");
+        assert_eq!(
+            seen[0].params.seed,
+            Some(987_654_321),
+            "the configured seed must arrive at the model, not SamplingParams::default"
+        );
+        assert_eq!(
+            seen[0].params.temperature,
+            Some(0.05),
+            "the configured temperature must arrive at the model, not SamplingParams::default"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_default_agent_config_sends_the_default_sampling_params() {
+        let model = Arc::new(OneShotModel::answering("done"));
+        let agent = ReActAgent::new(
+            Arc::clone(&model) as Arc<dyn Model>,
+            Conversation::new(4096),
+            AgentConfig::default(),
+        );
+
+        agent
+            .run("fix typo", &ToolRegistry::new())
+            .await
+            .expect("run should succeed");
+
+        let seen = model.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].params.seed, None, "an unset seed stays unset");
+        assert_eq!(
+            seen[0].params.temperature,
+            SamplingParams::default().temperature,
+            "leaving the config at default must not change what the model is sent"
         );
     }
 }

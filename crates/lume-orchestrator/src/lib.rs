@@ -34,6 +34,7 @@ pub struct Orchestrator {
     tools: Arc<ToolRegistry>,
     policy: RetryPolicy,
     budget: Mutex<TokenBudget>,
+    agent_config: AgentConfig,
 }
 
 impl Orchestrator {
@@ -51,7 +52,14 @@ impl Orchestrator {
             tools,
             policy,
             budget: Mutex::new(budget),
+            agent_config: AgentConfig::default(),
         }
+    }
+
+    /// Replace the [`AgentConfig`] every agent this orchestrator builds runs with.
+    pub fn with_agent_config(mut self, agent_config: AgentConfig) -> Self {
+        self.agent_config = agent_config;
+        self
     }
 
     /// Execute a task end to end: classify it, decompose it, then run one agent
@@ -169,7 +177,7 @@ impl Orchestrator {
         // `Orchestrator::new` takes no `LumeConfig`, so the harness default is
         // the only context window it can honour without a breaking signature.
         let conversation = Conversation::new(LumeConfig::default().context_window);
-        let agent = ReActAgent::new(model, conversation, AgentConfig::default());
+        let agent = ReActAgent::new(model, conversation, self.agent_config.clone());
         agent.run(prompt, &self.tools).await
     }
 
@@ -182,10 +190,11 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
-    use lume_core::types::ChatRequest;
+    use lume_core::types::{ChatRequest, SamplingParams};
 
     use super::*;
 
@@ -199,13 +208,15 @@ mod tests {
     }
 
     /// A `Model` that counts its calls and numbers its replies, so a test can
-    /// tell which model ran, how often, and in what order.
+    /// tell which model ran, how often, and in what order. It also records the
+    /// requests it was handed, so a test can assert what the agents actually sent.
     struct StubModel {
         name: &'static str,
         reply: &'static str,
         failure: Failure,
         fail_first: AtomicUsize,
         calls: AtomicUsize,
+        seen: StdMutex<Vec<ChatRequest>>,
     }
 
     impl StubModel {
@@ -227,12 +238,18 @@ mod tests {
                 failure,
                 fail_first: AtomicUsize::new(fail_first),
                 calls: AtomicUsize::new(0),
+                seen: StdMutex::new(Vec::new()),
             }
         }
 
         /// Number of `chat` calls served so far.
         fn calls(&self) -> usize {
             self.calls.load(Ordering::SeqCst)
+        }
+
+        /// Every request this stub was handed, in call order.
+        fn seen(&self) -> Vec<ChatRequest> {
+            self.seen.lock().expect("recorder poisoned").clone()
         }
     }
 
@@ -242,7 +259,8 @@ mod tests {
             self.name
         }
 
-        async fn chat(&self, _req: ChatRequest) -> Result<String> {
+        async fn chat(&self, req: ChatRequest) -> Result<String> {
+            self.seen.lock().expect("recorder poisoned").push(req);
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
             if call < self.fail_first.load(Ordering::SeqCst) {
                 return Err(match self.failure {
@@ -414,5 +432,58 @@ mod tests {
 
         let per_subtask = "small answer (call 1)".chars().count() / CHARS_PER_TOKEN;
         assert_eq!(spent, per_subtask * 2);
+    }
+
+    #[tokio::test]
+    async fn with_agent_config_reaches_every_agent_the_orchestrator_builds() {
+        let small = Arc::new(StubModel::answering("small", "small answer"));
+        let large = Arc::new(StubModel::answering("large", "large answer"));
+        let orch = orchestrator(Arc::clone(&large), Arc::clone(&small), 3, 10_000)
+            .with_agent_config(AgentConfig {
+                params: SamplingParams {
+                    temperature: Some(0.05),
+                    seed: Some(987_654_321),
+                    ..SamplingParams::default()
+                },
+                ..AgentConfig::default()
+            });
+
+        let _ = orch
+            .execute("fix typo\n\nfix another typo")
+            .await
+            .expect("run should succeed");
+
+        let seen = small.seen();
+        assert_eq!(seen.len(), 2, "two subtasks, one agent each");
+        for req in &seen {
+            assert_eq!(
+                req.params.seed,
+                Some(987_654_321),
+                "the configured seed must reach every subtask's model"
+            );
+            assert_eq!(
+                req.params.temperature,
+                Some(0.05),
+                "the configured temperature must reach every subtask's model"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_orchestrator_built_without_with_agent_config_sends_the_default_params() {
+        let small = Arc::new(StubModel::answering("small", "small answer"));
+        let large = Arc::new(StubModel::answering("large", "large answer"));
+        let orch = orchestrator(Arc::clone(&large), Arc::clone(&small), 3, 10_000);
+
+        let _ = orch.execute("fix typo").await.expect("run should succeed");
+
+        let seen = small.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].params.seed, None, "an unset seed stays unset");
+        assert_eq!(
+            seen[0].params.temperature,
+            SamplingParams::default().temperature,
+            "the default orchestrator must send exactly what it sent before"
+        );
     }
 }

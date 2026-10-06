@@ -1,7 +1,11 @@
 //! Lume CLI.
 
+mod chat;
+mod probe;
+
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -9,12 +13,18 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::filter::LevelFilter;
 
 use lume_agent::{
-    EditFileTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, ToolRegistry, WriteFileTool,
+    AgentConfig, EditFileTool, GrepTool, ListDirTool, ReadFileTool, ShellTool, ToolRegistry,
+    WriteFileTool,
 };
 use lume_core::Tool;
 use lume_core::config::LumeConfig;
+use lume_core::types::SamplingParams;
 use lume_llm::OllamaBackend;
+use lume_mcp::{DEFAULT_CONNECT_TIMEOUT, McpServerConnection};
 use lume_orchestrator::{Orchestrator, RetryPolicy, TokenBudget};
+
+use crate::chat::chat;
+use crate::probe::{ServerProbe, probe};
 
 /// CLI.
 #[derive(Parser)]
@@ -42,6 +52,9 @@ enum Command {
         /// Config path
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Seconds one phase of an MCP connection may take
+        #[arg(long, default_value_t = DEFAULT_CONNECT_TIMEOUT.as_secs())]
+        timeout: u64,
     },
     /// Chat interactively
     Chat {
@@ -80,13 +93,16 @@ enum McpAction {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Probe MCP server
+    /// Connect to configured MCP servers, list their tools, and call one
     Probe {
-        /// Server name
-        name: String,
+        /// Server name; every configured server when omitted
+        name: Option<String>,
         /// Config path
         #[arg(long)]
         config: Option<PathBuf>,
+        /// Seconds one phase of a connection may take
+        #[arg(long, default_value_t = DEFAULT_CONNECT_TIMEOUT.as_secs())]
+        timeout: u64,
     },
 }
 
@@ -102,6 +118,7 @@ async fn main() -> Result<()> {
             task,
             model,
             config,
+            timeout,
         } => {
             let cfg = LumeConfig::resolve(config.as_deref())?;
             let root = workspace_root(&cfg)?;
@@ -109,17 +126,28 @@ async fn main() -> Result<()> {
                 Some(only) => (only.clone(), only.clone()),
                 None => (cfg.small_model.clone(), cfg.large_model.clone()),
             };
+            let (mut tools, connections) = with_mcp_tools(registry(root), &cfg, timeout).await;
             let orchestrator = Orchestrator::new(
                 Arc::new(OllamaBackend::new(&cfg.ollama_url, &large_model)),
                 Arc::new(OllamaBackend::new(&cfg.ollama_url, &small_model)),
-                Arc::new(registry(root)),
+                Arc::new(std::mem::take(&mut tools)),
                 RetryPolicy::default(),
                 TokenBudget {
                     limit: cfg.context_window.saturating_mul(cfg.max_iterations),
                     spent: 0,
                 },
-            );
-            let outcome = orchestrator.execute(&task).await?;
+            )
+            .with_agent_config(AgentConfig {
+                params: SamplingParams {
+                    temperature: cfg.temperature,
+                    seed: cfg.seed,
+                    ..SamplingParams::default()
+                },
+                ..AgentConfig::default()
+            });
+            let outcome = orchestrator.execute(&task).await;
+            close_all(&connections).await;
+            let outcome = outcome?;
             println!("{}", outcome.final_text);
             if !outcome.tool_calls.is_empty() {
                 println!(
@@ -132,10 +160,10 @@ async fn main() -> Result<()> {
         Command::Chat { model, config } => {
             let cfg = LumeConfig::resolve(config.as_deref())?;
             let chosen = model.unwrap_or_else(|| cfg.small_model.clone());
-            eprintln!(
-                "chat mode is not wired up yet; it would run against {chosen}.\n\
-                 Use `lume run \"<task>\"` for a one-shot task instead."
-            );
+            let root = workspace_root(&cfg)?;
+            let (tools, connections) =
+                with_mcp_tools(registry(root), &cfg, DEFAULT_CONNECT_TIMEOUT.as_secs()).await;
+            chat(chosen, &cfg, tools, connections).await?;
         }
         Command::Models { config } => {
             let cfg = LumeConfig::resolve(config.as_deref())?;
@@ -174,14 +202,35 @@ async fn main() -> Result<()> {
                     println!("{:<16} {:?} {}", server.name, server.transport, detail);
                 }
             }
-            McpAction::Probe { name, config } => {
+            McpAction::Probe {
+                name,
+                config,
+                timeout,
+            } => {
                 let cfg = LumeConfig::resolve(config.as_deref())?;
-                match cfg.mcp_servers.iter().find(|s| s.name == name) {
-                    Some(server) => eprintln!(
-                        "probing {:?} is not wired up yet ({}); MCP servers are listed but not yet connected",
-                        server.transport, name
-                    ),
-                    None => eprintln!("no MCP server named {name:?} in the configuration"),
+                if cfg.mcp_servers.is_empty() {
+                    println!("no MCP servers configured");
+                    return Ok(());
+                }
+                let timeout = Duration::from_secs(timeout);
+                let reports = probe(&cfg.mcp_servers, name.as_deref(), timeout).await;
+                if let Some(name) = &name
+                    && !cfg.mcp_servers.iter().any(|server| &server.name == name)
+                {
+                    eprintln!("no MCP server named {name:?} in the configuration");
+                    return Ok(());
+                }
+                for report in &reports {
+                    print_report(report);
+                }
+                let broken = reports.iter().filter(|report| !report.connected()).count();
+                if broken == 0 {
+                    println!("\nall {} configured server(s) usable", reports.len());
+                } else {
+                    anyhow::bail!(
+                        "{broken} of {} configured MCP server(s) could not be used",
+                        reports.len()
+                    );
                 }
             }
         },
@@ -207,4 +256,123 @@ fn registry(root: PathBuf) -> ToolRegistry {
         Box::new(ShellTool::new(root)),
     ]);
     tools
+}
+
+/// Add every configured MCP server's tools to the builtins, and report what was
+/// skipped.
+///
+/// Returns the connections so the caller can close them: the registry holds the
+/// same clients, so nothing else would kill the server processes.
+async fn with_mcp_tools(
+    mut tools: ToolRegistry,
+    cfg: &LumeConfig,
+    timeout: u64,
+) -> (ToolRegistry, Vec<McpServerConnection>) {
+    let (connections, failures) =
+        lume_mcp::connect_servers(&cfg.mcp_servers, Duration::from_secs(timeout)).await;
+    for failure in &failures {
+        eprintln!(
+            "warning: MCP server {:?} is unavailable, skipping it: {}",
+            failure.server, failure.reason
+        );
+    }
+    for connection in &connections {
+        let registration = tools.register_server(connection);
+        for collision in &registration.collisions {
+            eprintln!("warning: {collision}");
+        }
+        eprintln!(
+            "mcp: {} contributes {} tool(s) over {}",
+            connection.server,
+            registration.registered.len(),
+            connection.revision
+        );
+    }
+    (tools, connections)
+}
+
+async fn close_all(connections: &[McpServerConnection]) {
+    for connection in connections {
+        let _ = connection.close().await;
+    }
+}
+
+fn print_report(report: &ServerProbe) {
+    match report {
+        ServerProbe::Called {
+            server,
+            revision,
+            server_info,
+            tools,
+            call,
+        } => {
+            println!(
+                "{}: connected over {}{}, {} tool(s)",
+                server,
+                revision,
+                server_info
+                    .as_ref()
+                    .map(|info| format!(" ({info})"))
+                    .unwrap_or_default(),
+                tools.len()
+            );
+            for tool in tools {
+                println!("    {tool}");
+            }
+            println!("    call {} {}", call.tool, call.arguments);
+            println!("    -> {}", indent(&call.text));
+        }
+        ServerProbe::Uncalled {
+            server,
+            revision,
+            server_info,
+            tools,
+            reason,
+        } => {
+            println!(
+                "{}: connected over {}{}, {} tool(s), none called: {reason}",
+                server,
+                revision,
+                server_info
+                    .as_ref()
+                    .map(|info| format!(" ({info})"))
+                    .unwrap_or_default(),
+                tools.len()
+            );
+            for tool in tools {
+                println!("    {tool}");
+            }
+        }
+        ServerProbe::Failed { server, reason } => {
+            println!("{server}: FAILED: {reason}");
+        }
+    }
+}
+
+fn indent(text: &str) -> String {
+    if text.is_empty() {
+        return "(no text content)".to_string();
+    }
+    text.lines()
+        .map(|line| format!("       {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::indent;
+
+    #[test]
+    fn indentation_pads_every_line_of_a_result() {
+        assert_eq!(
+            indent("Allowed directories:\n/home/vlad"),
+            "       Allowed directories:\n       /home/vlad"
+        );
+    }
+
+    #[test]
+    fn an_empty_result_says_so_instead_of_printing_nothing() {
+        assert_eq!(indent(""), "(no text content)");
+    }
 }

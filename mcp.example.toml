@@ -27,13 +27,13 @@ context_window = 8192
 name = "filesystem"
 transport = "stdio"
 command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/vlad/projects"]
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/home/vlad/opencode-projects"]
 
 [[mcp_servers]]
 name = "git"
 transport = "stdio"
 command = "uvx"
-args = ["mcp-server-git", "--repository", "/home/vlad/projects"]
+args = ["mcp-server-git", "--repository", "/home/vlad/opencode-projects/lume"]
 
 # [[mcp_servers]]
 # name = "fetch"

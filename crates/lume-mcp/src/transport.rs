@@ -45,6 +45,12 @@ pub trait Transport: Send {
 }
 
 /// Stdio transport: newline-delimited JSON-RPC over a child process.
+///
+/// The child is killed when the transport is dropped, not only when
+/// [`Transport::close`] is called: an abandoned `Box<dyn Transport>` from a
+/// cancelled task or a panic would otherwise leave the server process running
+/// for the lifetime of the machine. A stdio server is useless once its pipe is
+/// gone, so there is nothing worth preserving.
 pub struct StdioTransport {
     child: Child,
     stdin: tokio::process::ChildStdin,
@@ -68,6 +74,7 @@ impl StdioTransport {
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::inherit());
+        cmd.kill_on_drop(true);
         let mut child = cmd.spawn()?;
         let stdin = child
             .stdin
